@@ -1,0 +1,42 @@
+name: easytier-regression
+
+# 回归门：分支错配（unknown field "providers"）、tag 漏项、lazy/cache_runtime 默认值漂移，
+# 这些都该在 push 时被拦住，而不是等到打 APK 或装到手机上。
+
+on:
+  push:
+    branches: [feat/easytier-r1t]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: easytier-regression-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.2"
+          cache: true
+
+      - name: 全 tag 构建（本机验证过的同一组 tag）
+        run: go build -tags "with_easytier,with_quic,with_wireguard,with_utls,with_clash_api" -o /tmp/sing-box-full ./cmd/sing-box
+
+      - name: 二进制自检：easytier 出站真的编进去了
+        run: |
+          /tmp/sing-box-full version
+          /tmp/sing-box-full version 2>&1 | grep -q easytier || { echo "FATAL: 构建里没有 easytier 出站"; exit 1; }
+
+      - name: go vet
+        run: go vet -tags "with_easytier,with_quic,with_wireguard,with_utls,with_clash_api" ./protocol/easytier/... ./option/... ./include/...
+
+      - name: 选项单测（钉 lazy / cache_runtime 默认语义）
+        run: go test -count=1 -run EasyTier ./option/...

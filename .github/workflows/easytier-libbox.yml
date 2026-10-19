@@ -1,0 +1,65 @@
+name: easytier-libbox
+
+# 产出 libbox.aar / libbox-legacy.aar（Android）。工具链版本与本地实测一致：
+# Go 1.27.2 + JDK17 + NDK 28.0.13004108 + build-tools 37.0.0 + gomobile v0.1.13。
+# 注意：aar 落在仓库根，SFA 读的是 app/libs —— 下游 apk 工作流负责拷贝，别再漏这一步。
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "gomobile platform"
+        type: choice
+        default: android/arm64
+        options:
+          - android/arm64
+          - android/arm
+          - android/386
+          - android/amd64
+          - android
+
+permissions:
+  contents: read
+
+jobs:
+  aar:
+    runs-on: ubuntu-latest
+    env:
+      PLATFORM: ${{ inputs.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.2"
+          cache: true
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools build-tools;37.0.0 platforms;android-36 ndk;28.0.13004108"
+
+      - name: 安装并初始化 gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@v0.1.13
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          gomobile init -ndk-version 28
+          gomobile version
+
+      - name: 构建 libbox.aar
+        run: |
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          go run ./cmd/internal/build_libbox -target android -platform "$PLATFORM"
+          ls -la libbox.aar libbox-legacy.aar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libbox-aar
+          path: |
+            libbox.aar
+            libbox-legacy.aar
+          if-no-files-found: error

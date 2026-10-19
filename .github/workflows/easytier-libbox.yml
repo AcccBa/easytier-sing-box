@@ -43,16 +43,20 @@ jobs:
         with:
           packages: "platform-tools build-tools;37.0.0 platforms;android-36 ndk;28.0.13004108"
 
-      - name: 安装并初始化 gomobile
+      - name: 安装 gomobile / gobind（sing-box 用的是 sagernet fork，不是官方 x/mobile）
         run: |
-          go install golang.org/x/mobile/cmd/gomobile@v0.1.13
+          go install github.com/sagernet/gomobile/cmd/gomobile@v0.1.12
+          go install github.com/sagernet/gomobile/cmd/gobind@v0.1.12
           export PATH="$PATH:$(go env GOPATH)/bin"
-          gomobile init -ndk-version 28
+          export ANDROID_NDK_HOME="$(ls -d "$ANDROID_HOME"/ndk/28.0.* | head -1)"
+          echo "NDK=$ANDROID_NDK_HOME"
+          ls -l "$(go env GOPATH)/bin"/gomobile "$(go env GOPATH)/bin"/gobind
           gomobile version
 
       - name: 构建 libbox.aar
         run: |
           export PATH="$PATH:$(go env GOPATH)/bin"
+          export ANDROID_NDK_HOME="$(ls -d "$ANDROID_HOME"/ndk/28.0.* | head -1)"
           go run ./cmd/internal/build_libbox -target android -platform "$PLATFORM"
           ls -la libbox.aar libbox-legacy.aar
 

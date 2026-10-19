@@ -39,5 +39,19 @@ type EasyTierOutboundOptions struct {
 	ConfigTOML string `json:"config_toml,omitempty"`
 	// RouteWaitTimeout bounds the wait for an overlay route to the destination
 	// before dialing, so a cold start does not look like a hang. Default 10s.
+	// A lazily created instance gets RouteWaitTimeout plus extra cold-start
+	// budget, because routes only start flowing after the core joined.
 	RouteWaitTimeout badoption.Duration `json:"route_wait_timeout,omitempty"`
+	// Lazy defers creating the embedded core until the first dial to an overlay
+	// destination. The core is hosted by WebAssembly, so creating it costs a
+	// measured ~266MB peak and ~15s of JIT compilation on x86-64 (more on
+	// phones); lazy trades that away for a slow *first* overlay access.
+	// Default false (create at service start), so existing configs keep working.
+	Lazy bool `json:"lazy,omitempty"`
+	// CacheRuntime keeps the WebAssembly runtime alive when the last easytier
+	// outbound closes, so restarting the service reuses the already-compiled
+	// core instead of paying the peak + JIT cost again. The retained runtime
+	// measured +39MB RSS while idle. Default true; set false to give the memory
+	// back when the service is stopped.
+	CacheRuntime *bool `json:"cache_runtime,omitempty"`
 }

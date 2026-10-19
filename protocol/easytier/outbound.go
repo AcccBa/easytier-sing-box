@@ -24,6 +24,9 @@ import (
 
 const defaultRouteWaitTimeout = 10 * time.Second
 
+// coldRouteWait 是实例刚刚创建时额外给的路由等待预算：刚入网时路由表还是空的。
+const coldRouteWait = 20 * time.Second
+
 func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.EasyTierOutboundOptions](registry, C.TypeEasyTier, NewOutbound)
 }
@@ -38,11 +41,17 @@ var (
 	hostAccess   sync.Mutex
 	hostInstance *corehost.Host
 	hostRefCount int
+	// hostCacheOff 由任一显式设 cache_runtime=false 的 outbound 置位：
+	// 这是进程级扶择，显式意图优先于别人的默认值。
+	hostCacheOff bool
 )
 
-func acquireHost(ctx context.Context) (*corehost.Host, func(), error) {
+func acquireHost(ctx context.Context, cacheRuntime bool) (*corehost.Host, func(), error) {
 	hostAccess.Lock()
 	defer hostAccess.Unlock()
+	if !cacheRuntime {
+		hostCacheOff = true
+	}
 	if hostInstance == nil {
 		host, err := corehost.New(ctx, corehost.Options{})
 		if err != nil {
@@ -57,13 +66,19 @@ func acquireHost(ctx context.Context) (*corehost.Host, func(), error) {
 			hostAccess.Lock()
 			defer hostAccess.Unlock()
 			hostRefCount--
-			if hostRefCount == 0 {
-				closing := hostInstance
-				hostInstance = nil
-				go func() {
-					_ = closing.Close(context.Background())
-				}()
+			if hostRefCount > 0 || hostInstance == nil {
+				return
 			}
+			if !hostCacheOff {
+				// 保留 WebAssembly 运行时：它持有已编译的核心，下次启动免重编译
+				// （实测每次重建多付 ~266MB 峰值与 15 秒 JIT，空闲驻留代价 +39MB）。
+				return
+			}
+			closing := hostInstance
+			hostInstance = nil
+			go func() {
+				_ = closing.Close(context.Background())
+			}()
 		})
 	}, nil
 }
@@ -74,7 +89,9 @@ type Outbound struct {
 	logger       logger.ContextLogger
 	options      option.EasyTierOutboundOptions
 	routeTimeout time.Duration
+	cacheRuntime bool
 	access       sync.Mutex
+	createAccess sync.Mutex
 	host         *corehost.Host
 	releaseHost  func()
 	instance     *corehost.Instance
@@ -122,12 +139,17 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if routeTimeout == 0 {
 		routeTimeout = defaultRouteWaitTimeout
 	}
+	cacheRuntime := true
+	if options.CacheRuntime != nil {
+		cacheRuntime = *options.CacheRuntime
+	}
 	return &Outbound{
 		Adapter:      outbound.NewAdapter(C.TypeEasyTier, tag, []string{N.NetworkTCP, N.NetworkUDP}, nil),
 		ctx:          ctx,
 		logger:       logger,
 		options:      options,
 		routeTimeout: routeTimeout,
+		cacheRuntime: cacheRuntime,
 	}, nil
 }
 
@@ -135,22 +157,73 @@ func (o *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateInitialize {
 		return nil
 	}
-	host, releaseHost, err := acquireHost(o.ctx)
-	if err != nil {
+	scope.Add(o.Close)
+	if o.options.Lazy {
+		o.logger.Info("easytier outbound 懒启动：首次拨向 overlay 目的地时才创建实例")
+		return nil
+	}
+	if _, err := o.ensureInstance(); err != nil {
 		return err
+	}
+	return nil
+}
+
+// ensureInstance 创建并启动内嵌核实例，可重复调用；已存在则直接返回。
+// 返回 created=true 表示本次调用完成了创建，调用方据此给首次路由等待更多预算。
+// 用服务级 ctx 创建：拨号方超时退出不该把实例创建打断在中途。
+func (o *Outbound) ensureInstance() (created bool, err error) {
+	o.access.Lock()
+	ready := o.instance
+	o.access.Unlock()
+	if ready != nil {
+		return false, nil
+	}
+	// 单次飞行：首个拨号付编译成本，其余并发拨号排在后面复用同一实例
+	o.createAccess.Lock()
+	defer o.createAccess.Unlock()
+	o.access.Lock()
+	ready = o.instance
+	o.access.Unlock()
+	if ready != nil {
+		return false, nil
+	}
+
+	if o.options.Lazy {
+		o.logger.Info("首次访问 overlay，正在创建 EasyTier 实例：首次需把 WebAssembly 核心编译到本机码，可能要十几到几十秒")
+	}
+	host, releaseHost, err := acquireHost(o.ctx, o.cacheRuntime)
+	if err != nil {
+		return false, err
 	}
 	o.access.Lock()
 	o.host = host
 	o.releaseHost = releaseHost
 	o.access.Unlock()
-	scope.Add(o.Close)
 
+	instance, err := o.startInstance(host)
+	if err != nil {
+		o.access.Lock()
+		o.releaseHost = nil
+		o.access.Unlock()
+		releaseHost()
+		return false, err
+	}
+	o.access.Lock()
+	o.instance = instance
+	o.access.Unlock()
+	return true, nil
+}
+
+// startInstance 只负责实例的创建/启动/日志，并发与引用计数由调用方管。
+func (o *Outbound) startInstance(host *corehost.Host) (*corehost.Instance, error) {
+	ctx := o.ctx
 	instanceName := o.Tag()
 	var instance *corehost.Instance
+	var err error
 	if o.options.ConfigTOML != "" {
-		instance, err = host.CreateInstanceTOML(scope.Context(), instanceName, "", o.options.ConfigTOML)
+		instance, err = host.CreateInstanceTOML(ctx, instanceName, "", o.options.ConfigTOML)
 		if err != nil {
-			return E.Cause(err, "create easytier instance from `config_toml`")
+			return nil, E.Cause(err, "create easytier instance from `config_toml`")
 		}
 	} else {
 		builder := corehost.NewInstanceConfigBuilder(o.options.NetworkName).
@@ -159,9 +232,9 @@ func (o *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			builder = builder.Hostname(o.options.Hostname)
 		}
 		if o.options.IPv4Prefix != "" {
-			prefix, err := netip.ParsePrefix(o.options.IPv4Prefix)
-			if err != nil {
-				return E.Cause(err, "parse `ipv4`")
+			prefix, parseErr := netip.ParsePrefix(o.options.IPv4Prefix)
+			if parseErr != nil {
+				return nil, E.Cause(parseErr, "parse `ipv4`")
 			}
 			builder = builder.IPv4(prefix)
 		}
@@ -174,27 +247,24 @@ func (o *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		if o.options.Encryption != nil {
 			builder = builder.Encryption(*o.options.Encryption)
 		}
-		instanceConfig, err := builder.Build()
-		if err != nil {
-			return E.Cause(err, "build easytier instance config")
+		instanceConfig, buildErr := builder.Build()
+		if buildErr != nil {
+			return nil, E.Cause(buildErr, "build easytier instance config")
 		}
-		instance, err = host.CreateInstance(scope.Context(), instanceConfig)
+		instance, err = host.CreateInstance(ctx, instanceConfig)
 		if err != nil {
-			return E.Cause(err, "create easytier instance")
+			return nil, E.Cause(err, "create easytier instance")
 		}
 	}
-	if err = instance.Start(scope.Context()); err != nil {
-		_ = instance.Close(scope.Context())
-		return E.Cause(err, "start easytier instance")
+	if err = instance.Start(ctx); err != nil {
+		_ = instance.Close(ctx)
+		return nil, E.Cause(err, "start easytier instance")
 	}
-	o.access.Lock()
-	o.instance = instance
-	o.access.Unlock()
 
-	if nodeInfo, infoErr := instance.ShowNodeInfo(scope.Context()); infoErr == nil {
+	if nodeInfo, infoErr := instance.ShowNodeInfo(ctx); infoErr == nil {
 		o.logger.Info("easytier instance started: ", nodeInfo.GetHostname(), " ipv4=", o.options.IPv4Prefix)
 	}
-	routes, routeErr := instance.ListRoute(scope.Context())
+	routes, routeErr := instance.ListRoute(ctx)
 	if routeErr == nil {
 		for _, route := range routes {
 			if prefix, isParsed := routePrefix(route); isParsed {
@@ -202,7 +272,7 @@ func (o *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			}
 		}
 	}
-	return nil
+	return instance, nil
 }
 
 func (o *Outbound) Close() error {
@@ -255,7 +325,7 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 }
 
 func (o *Outbound) dial(ctx context.Context, destination M.Socksaddr, network string) (net.Conn, error) {
-	instance, err := o.readyInstance()
+	instance, routeBudget, err := o.readyInstance()
 	if err != nil {
 		return nil, err
 	}
@@ -263,7 +333,7 @@ func (o *Outbound) dial(ctx context.Context, destination M.Socksaddr, network st
 	if err != nil {
 		return nil, err
 	}
-	if err = o.waitRoute(ctx, destination.Addr); err != nil {
+	if err = o.waitRoute(ctx, instance, destination.Addr, routeBudget); err != nil {
 		return nil, err
 	}
 	ctx, metadata := adapter.ExtendContext(ctx)
@@ -280,14 +350,32 @@ func (o *Outbound) dialUDP(ctx context.Context, destination M.Socksaddr) (*datag
 	return &datagramConn{Conn: conn, peer: destination}, nil
 }
 
-func (o *Outbound) readyInstance() (*corehost.Instance, error) {
+// readyInstance 返回可用实例与本次的路由等待预算；懒启动时在这里完成创建。
+func (o *Outbound) readyInstance() (*corehost.Instance, time.Duration, error) {
 	o.access.Lock()
 	instance := o.instance
 	o.access.Unlock()
-	if instance == nil {
-		return nil, E.New("easytier instance is not started")
+	if instance != nil {
+		return instance, o.routeTimeout, nil
 	}
-	return instance, nil
+	if !o.options.Lazy {
+		return nil, 0, E.New("easytier instance is not started")
+	}
+	created, err := o.ensureInstance()
+	if err != nil {
+		return nil, 0, err
+	}
+	o.access.Lock()
+	instance = o.instance
+	o.access.Unlock()
+	if instance == nil {
+		return nil, 0, E.New("easytier instance is not started")
+	}
+	if created {
+		// 刚建好就拨：路由表还是空的，多给冷启动预算
+		return instance, o.routeTimeout + coldRouteWait, nil
+	}
+	return instance, o.routeTimeout, nil
 }
 
 // The socket data plane is overlay-IPv4 only and does not resolve names:
@@ -304,16 +392,16 @@ func (o *Outbound) overlayAddress(destination M.Socksaddr) (string, error) {
 
 // The overlay needs a few seconds after start before the first dial; waiting
 // for a route turns that cold start into a log line instead of a timeout.
-func (o *Outbound) waitRoute(ctx context.Context, destination netip.Addr) error {
-	if o.routeTimeout <= 0 {
+func (o *Outbound) waitRoute(ctx context.Context, instance *corehost.Instance, destination netip.Addr, budget time.Duration) error {
+	if budget <= 0 {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, o.routeTimeout)
+	ctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		routes, err := o.instance.ListRoute(ctx)
+		routes, err := instance.ListRoute(ctx)
 		if err != nil {
 			// Route lookup is advisory: the dial below fails fast on its own.
 			o.logger.WarnContext(ctx, "easytier route lookup failed: ", err)

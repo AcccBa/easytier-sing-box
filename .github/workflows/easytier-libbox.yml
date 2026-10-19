@@ -63,3 +63,5 @@ jobs:
             libbox.aar
             libbox-legacy.aar
           if-no-files-found: error
+
+# 触发 GitHub 对该文件的登记（新仓 workflow 索引滞后）

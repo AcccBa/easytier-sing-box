@@ -105,6 +105,7 @@ func OutboundRegistry() *outbound.Registry {
 
 	registerQUICOutbounds(registry)
 	registerTailcatOutbound(registry)
+	registerEasyTierOutbound(registry)
 	registerStubForRemovedOutbounds(registry)
 
 	return registry

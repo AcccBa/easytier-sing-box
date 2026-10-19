@@ -1,6 +1,9 @@
 # sing-box
 
 The universal proxy platform.
+> **下游改造说明（fork）** — 本仓基于 [reF1nd/sing-box](https://github.com/reF1nd/sing-box) 的 `reF1nd-testing` 线；上游版权归 reF1nd 项目，Apache-2.0 许可证（见 `LICENSE`）保持不变。我们只加了一件事：**把 EasyTier 组网内核以 wazero 内嵌为 sing-box 的 `easytier` 出站**（构建 tag `with_easytier`），另加生命周期选项 `lazy` / `cache_runtime`（后者默认开，省掉每次服务重启重编 wasm JIT 的 15–20s 与约 266MB 峰值）。回归门与 aar 构建见 `.github/workflows/easytier-*.yml`。
+>
+> 注：本仓与上游的 GitHub fork 关系因可见性变更被平台剥离（用户侧不可恢复），同步上游只能手工：`git remote add upstream https://github.com/reF1nd/sing-box && git fetch upstream && git merge upstream/reF1nd-testing`；解完冲突必须跑 `easytier-regression`。
 
 [![Packaging status](https://repology.org/badge/vertical-allrepos/sing-box.svg)](https://repology.org/project/sing-box/versions)
 

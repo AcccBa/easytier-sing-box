@@ -35,6 +35,7 @@ const (
 	TypeMASQUEServer       = "masque-server"
 	TypeTailscale          = "tailscale"
 	TypeTailcat            = "tailcat"
+	TypeEasyTier           = "easytier"
 	TypeCloudflared        = "cloudflared"
 	TypeDERP               = "derp"
 	TypeResolved           = "resolved"
@@ -126,6 +127,8 @@ func ProxyDisplayName(proxyType string) string {
 		return "Tailscale"
 	case TypeTailcat:
 		return "Tailcat"
+	case TypeEasyTier:
+		return "EasyTier"
 	case TypeCloudflared:
 		return "Cloudflared"
 	case TypeSelector:

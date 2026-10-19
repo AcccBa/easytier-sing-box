@@ -6,6 +6,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -82,6 +83,35 @@ type Outbound struct {
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.EasyTierOutboundOptions) (adapter.Outbound, error) {
 	if options.ConfigTOML == "" && options.NetworkName == "" {
 		return nil, E.New("`network_name` is required unless `config_toml` is set")
+	}
+	// `config_toml` 是整份配置直通，会静默吞掉 builder 字段（曾导致入网参数全部丢失的哑故障），
+	// 因此两者同时出现时直接报错，不猜意图。
+	if options.ConfigTOML != "" {
+		var conflict []string
+		if options.NetworkName != "" {
+			conflict = append(conflict, "network_name")
+		}
+		if options.NetworkSecret != "" {
+			conflict = append(conflict, "network_secret")
+		}
+		if options.Hostname != "" {
+			conflict = append(conflict, "hostname")
+		}
+		if options.IPv4Prefix != "" {
+			conflict = append(conflict, "ipv4")
+		}
+		if len(options.Peers) > 0 {
+			conflict = append(conflict, "peers")
+		}
+		if len(options.Listeners) > 0 {
+			conflict = append(conflict, "listeners")
+		}
+		if options.Encryption != nil {
+			conflict = append(conflict, "encryption")
+		}
+		if len(conflict) > 0 {
+			return nil, E.New("`config_toml` 与这些字段冲突且会覆盖它们: ", strings.Join(conflict, ", "), "；只保留 `config_toml` 或只保留结构化字段")
+		}
 	}
 	if options.IPv4Prefix != "" {
 		if _, err := netip.ParsePrefix(options.IPv4Prefix); err != nil {
